@@ -1,176 +1,83 @@
-from socket import *
-from threading import Thread
-import time
-import argparse
-import json
 import logging
-import inspect
-import client_log_config
+import logs.config_client_log
+import argparse
+import sys
+from PyQt5.QtWidgets import QApplication
 
-cli_log = logging.getLogger('client')
+from common.variables import *
+from common.errors import ServerError
+from common.decos import log
+from client.database import ClientDatabase
+from client.transport import ClientTransport
+from client.main_window import ClientMainWindow
+from client.start_dialog import UserNameDialog
 
-enable_tracing = False
-
-def log(func):
-
-    if enable_tracing:
-        def callf(*args,**kwargs):
-            cli_log.info("Функция %s: вызвана из функции  %s" % (func.__name__ , inspect.stack()[1][3]))
-            r = func(*args, **kwargs)
-            cli_log.info("%s вернула %s" % (func.__name__, r))
-            return r
-        return callf
-    else:
-        return func
+# Инициализация клиентского логера
+logger = logging.getLogger('client')
 
 
+# Парсер аргументов коммандной строки
 @log
-def parse_message(str1):
-    try:
-        serv_message = json.loads(str1)
-        if serv_message["response"] in (100, 101, 102, 200, 201, 202):
-            cli_log.info("Сообщение доставлено на сервер, код возврата %s, %s " % (
-            str(serv_message["response"]), serv_message["alert"]))
-            return serv_message
-    except json.decoder.JSONDecodeError:
-        cli_log.critical("Сообщение от сервера не распознано: %s ", str1)
-        return {
-            "response": 400,
-            "time": time.time(),
-            "alert": "Сообщение от сервера не распознано"
-        }
+def arg_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('addr', default=DEFAULT_IP_ADDRESS, nargs='?')
+    parser.add_argument('port', default=DEFAULT_PORT, type=int, nargs='?')
+    parser.add_argument('-n', '--name', default=None, nargs='?')
+    namespace = parser.parse_args(sys.argv[1:])
+    server_address = namespace.addr
+    server_port = namespace.port
+    client_name = namespace.name
+
+    # проверим подходящий номер порта
+    if not 1023 < server_port < 65536:
+        logger.critical(
+            f'Попытка запуска клиента с неподходящим номером порта: {server_port}. Допустимы адреса с 1024 до 65535. Клиент завершается.')
+        exit(1)
+
+    return server_address, server_port, client_name
 
 
-@log
-def presence(username, status):
-    return {
-        "action": "presence",
-        "time": time.time(),
-        "type": "status",
-        "user": {
-            "account_name": username,
-            "status": status
-        }
-    }
-
-@log
-def message_to_user(from_user, to_user, msg):  # сформировать сообщение;
-    # to_user = ""
-    # while (len(to_user) == 0) or (len(to_user) > 25):
-    #     to_user = input("Кому отправить сообщение:")
-    #     if (len(to_user) == 0) or (len(to_user) > 25):
-    #         print("имя пользователя/название чата должно содержать от 1 до 25 символов")
-    # msg = ""
-    # while (len(msg) == 0) or (len(msg) > 500):
-    #     msg = input("Введите сообщение:")
-    #     if (len(msg) == 0) or (len(msg) > 500):
-    #         print("сообщение должно содержать максимум 500 символов")
-    return {
-        "action": "msg",
-        "time": time.time(),
-        "to": to_user,
-        "from": from_user,
-        "encoding": "utf-8",
-        "message": msg
-    }
-
-def message_chat(from_user, msg):
-    return {
-        "action": "msg",
-        "time": time.time(),
-        "to": "ALL",
-        "from": from_user,
-        "encoding": "utf-8",
-        "message": msg
-    }
-
-def join_chat(from_user, room_name):
-    return {
-        "action": "join",
-        "time": time.time(),
-        "from": from_user,
-        "room": room_name
-    }
-
-def leave_chat(from_user, room_name):
-    return {
-        "action": "leave",
-        "time": time.time(),
-        "from": from_user,
-        "room": room_name
-    }
-
-
-def read_server_messages(sock):
-    while True:
-        data = sock.recv(1024).decode('utf-8')
-        server_resp = {}
-        server_resp = parse_message(data)
-        print(server_resp["alert"])
-
-
-def client_loop(host, port):
-    with socket(AF_INET, SOCK_STREAM) as sock:
-        cli_log.info("Попытка соединения с %s по порту %s" % (host, port))
-
-        try:
-            sock.connect((host, port))
-        except ConnectionRefusedError:
-            cli_log.critical("Сервер %s недоступен по порту %s" % (host, port))
-            return
-        except OSError as err:
-            cli_log.critical("OS error: {0}".format(err))
-            return
-        else:
-            cli_log.info("Подключен к %s по порту %s" % (host, port))
-        username = input('Имя пользователя: ')
-        msg = json.dumps(presence(username, "Yep, I am here!"))
-        sock.send(msg.encode('utf-8'))
-        print("presense message sent")
-        data = sock.recv(1024).decode('utf-8')
-        server_resp = parse_message(data)
-        print(server_resp["alert"])
-        receiver = read_server_messages(sock)
-        th_sender = Thread(target=receiver)
-        th_sender.daemon = True
-        th_sender.start()
-
-        while True:
-            msg = input('Ваше сообщение: ')
-            if msg == 'exit':
-                break
-            msg = json.dumps(message_chat(username, msg))
-            sock.send(msg.encode('utf-8'))
-
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Client App')
-    parser.add_argument("-a", action="store", dest="addr", type=str, default='localhost',
-                        help="enter IP address, default is localhost")
-    parser.add_argument("-p", action="store", dest="port", type=int, default=7777,
-                        help="enter port number, default is 7777")
-    # parser.add_argument("-t", action="store", dest="trace", type=str, default='false',
-    #                    help="enter 'true' to enable tracing, default is 'false'")
-    return parser.parse_args()
-
-
-def main():
-    #print("main working")
-    cli_log.debug('Старт приложения')
-    args = parse_args()
-    port = args.port
-    host = args.addr
-    # enable_tracing = args.trace
-    print("Connecting to %s:%s" % (host, port))
-    client_loop(host, port)
-    # resp = ''
-    # msg = json.dumps(presence("Artem", "Yep, I am here!"))
-    # communicate(msg, resp, host, port)
-    # msg = json.dumps(message_from_user("Artem"))
-    # communicate(msg, resp, host, port)
-
-
-
+# Основная функция клиента
 if __name__ == '__main__':
-    main()
+    # Загружаем параметы коммандной строки
+    server_address, server_port, client_name = arg_parser()
+
+    # Создаём клиентокое приложение
+    client_app = QApplication(sys.argv)
+
+    # Если имя пользователя не было указано в командной строке то запросим его
+    if not client_name:
+        start_dialog = UserNameDialog()
+        client_app.exec_()
+        # Если пользователь ввёл имя и нажал ОК, то сохраняем ведённое и удаляем объект, инааче выходим
+        if start_dialog.ok_pressed:
+            client_name = start_dialog.client_name.text()
+            del start_dialog
+        else:
+            exit(0)
+
+    # Записываем логи
+    logger.info(
+        f'Запущен клиент с парамертами: адрес сервера: {server_address} , порт: {server_port}, имя пользователя: {client_name}')
+
+    # Создаём объект базы данных
+    database = ClientDatabase(client_name)
+
+    # Создаём объект - транспорт и запускаем транспортный поток
+    try:
+        transport = ClientTransport(server_port, server_address, database, client_name)
+    except ServerError as error:
+        print(error.text)
+        exit(1)
+    transport.setDaemon(True)
+    transport.start()
+
+    # Создаём GUI
+    main_window = ClientMainWindow(database, transport)
+    main_window.make_connection(transport)
+    main_window.setWindowTitle(f'Чат Программа alpha release - {client_name}')
+    client_app.exec_()
+
+    # Раз графическая оболочка закрылась, закрываем транспорт
+    transport.transport_shutdown()
+    transport.join()
